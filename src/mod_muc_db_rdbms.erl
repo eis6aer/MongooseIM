@@ -37,11 +37,19 @@
 aff_atom2db(owner) -> "1";
 aff_atom2db({owner, _}) -> "1";
 aff_atom2db(member) -> "2";
-aff_atom2db({member, _}) -> "2".
+aff_atom2db({member, _}) -> "2";
+aff_atom2db(admin) -> "3";
+aff_atom2db({admin, _}) -> "3";
+aff_atom2db(outcast) -> "4";
+aff_atom2db({outcast, _}) -> "4";
+aff_atom2db(_Other) -> "5".
 
 -spec aff_db2atom(binary() | pos_integer()) -> aff().
 aff_db2atom(1) -> owner;
 aff_db2atom(2) -> member;
+aff_db2atom(3) -> admin;
+aff_db2atom(4) -> outcast;
+aff_db2atom(5) -> none;
 aff_db2atom(Bin) -> aff_db2atom(mongoose_rdbms:result_to_integer(Bin)).
 
 -spec bin(integer() | binary()) -> binary().
@@ -55,84 +63,70 @@ init(_ServerHost, _Opts) ->
 -spec store_room(server_host(), muc_host(), mod_muc:room(), room_opts()) ->
     ok | {error, term()}.
 store_room(ServerHost, MucHost, RoomName, Opts) ->
+    forget_room(ServerHost, MucHost, RoomName),
     Affs = proplists:get_value(affiliations, Opts),
-    % ?WARNING_MSG("AFFS: ~p", [Affs]),
     NewOpts = proplists:delete(affiliations, Opts),
     EncodedOpts = jiffy:encode({NewOpts}),
-    {atomic, Res}
-        = mongoose_rdbms:sql_transaction(
-            ServerHost, fun() ->
-                store_room_transaction(ServerHost, MucHost, RoomName, EncodedOpts, Affs) end),
-
-    Test = mongoose_rdbms:sql_query(ServerHost, select_opts(MucHost, RoomName)),
-    ?WARNING_MSG("Test Select Options: ~p", [Test]),
+    {atomic, Res} = mongoose_rdbms:sql_transaction(
+        ServerHost, fun() ->
+        store_room_transaction(ServerHost, MucHost, RoomName, EncodedOpts, Affs) end),
     Res.
 
 store_room_transaction(ServerHost, MucHost, RoomName, Opts, Affs) ->
-    case catch mongoose_rdbms:sql_query(ServerHost, insert_room(MucHost, RoomName, Opts)) of
+    InsertRoom = insert_room(MucHost, RoomName, Opts),
+    case catch mongoose_rdbms:sql_query_t(InsertRoom) of
         {aborted, Reason} ->
             mongoose_rdbms:sql_query_t("ROLLBACK;"),
             {error, Reason};
         {updated, _ } ->
-            {selected, [{RoomID}| _Rest] = _AllIds} = mongoose_rdbms:sql_query_t(
+            {selected, [{RoomID}]} = mongoose_rdbms:sql_query(ServerHost,
                                           select_room_id(MucHost, RoomName)),
-            store_aff(ServerHost, RoomID, Affs),
+            store_aff(RoomID, Affs),
             ok;
-        {error, Reason} -> {error, Reason}
+        _Other ->
+                mongoose_rdbms:sql_query_t("ROLLBACK;"),
+                {error, unexpected}
     end.
 
-store_aff(_, _, undefined) ->
+store_aff( _, undefined) ->
      ok;
-store_aff(ServerHost, RoomID, Affs) ->
+store_aff(RoomID, Affs) ->
     lists:foreach(
-              fun({{UserU, UserS, _Role}, Aff}) ->
-                      {updated, _}
-                      = mongoose_rdbms:sql_query(
-                          ServerHost, insert_aff(RoomID, UserU, UserS, Aff))
-              end, Affs).
-    % Test = mongoose_rdbms:sql_query(ServerHost, ["SELECT * FROM muc_room_aff"]),
-    % ?WARNING_MSG("ServerHost: ~p, ~nAfiliations Table: ~p", [ServerHost,  Test]).
+        fun({{UserU, UserS, Resource}, Aff}) ->
+            {updated, _} = mongoose_rdbms:sql_query_t(
+                insert_aff(RoomID, UserU, UserS, Resource, Aff))
+            end, Affs).
 
-
+get_full_options(ServerHost, Opts, RoomID) ->
+    {selected, Affs} = mongoose_rdbms:sql_query(ServerHost, select_aff(RoomID)),
+    {DecodedOpts} = jiffy:decode(Opts),
+    RestoredOpts = [{binary_to_existing_atom(Key, utf8), Value}||{Key, Value} <- DecodedOpts],
+    AffsList = [{{UserU, UserS, Res}, aff_db2atom(Aff)} || {UserU, UserS, Res, Aff} <- Affs],
+    lists:flatten([ RestoredOpts| [{affiliations, AffsList}]]).
 
 -spec restore_room(server_host(), muc_host(), mod_muc:room()) ->
     {ok, room_opts()} | {error, room_not_found} | {error, term()}.
 restore_room(ServerHost, MucHost, RoomName) ->
-    SelectOpts = select_opts(MucHost,RoomName),
-    ?WARNING_MSG("Select opts: ~p", [SelectOpts]),
-    Res = mongoose_rdbms:sql_query_t(SelectOpts),
-    {selected, Opts} = Res,
-    ?WARNING_MSG("Res: ~p, Host:~p, RoomName~p", [Res, MucHost, RoomName]),
-
-    Test2 = mongoose_rdbms:sql_query(ServerHost, ["SELECT * FROM muc_rooms"]),
-    ?WARNING_MSG("Test2: ~p", [Test2]),
-
-    {selected, [{RoomID} | _Rest] = _AllIds} = mongoose_rdbms:sql_query_t(
-         select_room_id(MucHost, RoomName)),
-    ResAff = mongoose_rdbms:sql_query_t(select_aff(RoomID)),
-    case {Opts, ResAff} of
-        {[], {selected, []}} ->
+    case mongoose_rdbms:sql_query(ServerHost, select_room(MucHost, RoomName)) of
+        {selected, [{RoomID, Opts}]} ->
+                    FullOpts = get_full_options(ServerHost, Opts, RoomID),
+                    {ok, FullOpts};
+        {selected, []} ->
             {error, room_not_found};
-        {[], {selected, [_]}} ->
-            {error, room_not_found};
-        {[Options], {selected, Affs}} ->
-            DecodedOpts = jiffy:decode(Options),
-            ?WARNING_MSG("Decoded Opts: ~p", [DecodedOpts]),
-            AffsList = [{{UserU, UserS, <<>>}, aff_db2atom(Aff)} || {UserU, UserS, Aff} <- Affs],
-            NewDecodedOpts = proplists:append_values(AffsList, DecodedOpts),
-            {ok, NewDecodedOpts}
-    end.
+        Other ->
+            {error, Other}
+     end.
 
 -spec forget_room(server_host(), muc_host(), mod_muc:room()) ->
     ok | {error, term()}.
 forget_room(ServerHost, MucHost, RoomName) ->
     {atomic, _Res}
         = mongoose_rdbms:sql_transaction(ServerHost,
-            fun() -> forget_room_transaction(MucHost, RoomName) end),
+            fun() -> forget_room_transaction(ServerHost, MucHost, RoomName) end),
     ok.
 
-forget_room_transaction(MucHost, RoomName) ->
-    case mongoose_rdbms:sql_query_t(select_room_id(MucHost, RoomName)) of
+forget_room_transaction(ServerHost, MucHost, RoomName) ->
+    case mongoose_rdbms:sql_query(ServerHost, select_room_id( MucHost, RoomName)) of
         {selected, [{RoomID}]} ->
             {updated, _} = mongoose_rdbms:sql_query_t(delete_affs(RoomID)),
             {updated, _} = mongoose_rdbms:sql_query_t(delete_room(MucHost, RoomName)),
@@ -141,18 +135,21 @@ forget_room_transaction(MucHost, RoomName) ->
             {error, not_exists}
     end.
 
-
 -spec get_rooms(server_host(), muc_host()) -> {ok, [#muc_room{}]} | {error, term()}.
-get_rooms(_ServerHost, MucHost) ->
+get_rooms(ServerHost, MucHost) ->
     SelectRooms = select_rooms(MucHost),
-    case mongoose_rdbms:sql_query_t(SelectRooms) of
-            {selected, [Rooms]} ->
-                {ok, Rooms};
-            {selected, []} ->
-                {error, not_exists}
-        end.
+    case mongoose_rdbms:sql_query(ServerHost, SelectRooms) of
+        {selected, Reply} ->
+            Return = [{MucHost,{RoomName, ServerHost},
+                        get_full_options(ServerHost,Opts, RoomID)}
+                                ||{RoomID, RoomName, Opts} <- Reply],
+                % Return = [{MucHost, {RoomName, ServerHost}, Opts} || {RoomName, {Opts}} <- ReplyDecodedOpts],
+            {ok, Return};
+        Other -> {error, Other}
+    end.
 
--spec can_use_nick(server_host(), muc_host(), client_jid(), mod_muc:nick()) -> boolean().
+-spec can_use_nick(server_host(), muc_host(), client_jid(), mod_muc:nick()) ->
+    boolean().
 can_use_nick(ServerHost, MucHost, Jid, Nick) ->
     {UserU, UserS} = jid:to_lus(Jid),
     SelectQuery = select_nick_user(MucHost, UserS, Nick),
@@ -188,13 +185,13 @@ store_nick_transaction(_ServerHost, _MucHost, _Jid, _Nick, false) ->
 store_nick_transaction(ServerHost, MucHost, Jid, Nick, true) ->
     LUS = jid:to_lus(Jid),
     case catch mongoose_rdbms:sql_query(ServerHost, insert_nick( MucHost, LUS, Nick)) of
-            {aborted, Reason} ->
-                    mongoose_rdbms:sql_query_t("ROLLBACK;"),
-                    ?ERROR_MSG("event=set_nick_failed jid=~ts nick=~ts reason=~1000p",
-                         [jid:to_binary(Jid), Nick, Reason]),
-                    {error, Reason};
-            {updated, _ } ->
-                ok
+        {aborted, Reason} ->
+                mongoose_rdbms:sql_query_t("ROLLBACK;"),
+                ?ERROR_MSG("event=set_nick_failed jid=~ts nick=~ts reason=~1000p",
+                    [jid:to_binary(Jid), Nick, Reason]),
+                {error, Reason};
+        {updated, _ } ->
+            ok
     end.
 
 %% Unregister nick
@@ -210,21 +207,22 @@ insert_room(MucHost, RoomName, Opts) ->
      " VALUES (", ?ESC(MucHost), ", ", ?ESC(RoomName), ",", ?ESC(Opts) ,")"].
 
 -spec insert_aff(RoomID :: integer() | binary(), UserU :: jid:luser(),
-                 UserS :: jid:lserver(), Aff :: aff()) -> iolist().
-insert_aff(RoomID, UserU, UserS, Aff) ->
-    ["INSERT INTO muc_room_aff (room_id, luser, lserver, aff)"
+                 UserS :: jid:lserver(), Res ::iolist(), Aff :: aff()) -> iolist().
+insert_aff(RoomID, UserU, UserS, Res, Aff) ->
+    ["INSERT INTO muc_room_aff (room_id, luser, lserver, resource, aff)"
      " VALUES(", bin(RoomID), ", ", ?ESC(UserU), ", ", ?ESC(UserS), ", ",
-              aff_atom2db(Aff), ")"].
+      ?ESC(Res), ", ", aff_atom2db(Aff), ")"].
 
 select_aff(RoomID) ->
-    ["SELECT luser, lserver, aff FROM muc_room_aff WHERE room_id = ", ?ESC(RoomID)].
+    ["SELECT luser, lserver, resource, aff FROM muc_room_aff WHERE room_id = ",
+     ?ESC(RoomID)].
 
 select_room_id(MucHost, RoomName) ->
     ["SELECT id FROM muc_rooms WHERE muc_host = ", ?ESC(MucHost),
     " AND room = ", ?ESC(RoomName)].
 
-select_opts(MucHost, RoomName) ->
-    ["SELECT options FROM muc_rooms WHERE muc_host = ", ?ESC(MucHost),
+select_room(MucHost, RoomName) ->
+    ["SELECT id, options FROM muc_rooms WHERE muc_host = ", ?ESC(MucHost),
     " AND room = ", ?ESC(RoomName)].
 
 delete_affs(RoomID) ->
@@ -235,11 +233,12 @@ delete_room(MucHost, RoomName) ->
      " WHERE muc_host = ", ?ESC(MucHost), " AND room = ", ?ESC(RoomName)].
 
 select_rooms(MucHost) ->
-    ["SELECT room FROM muc_rooms WHERE muc_host = ", ?ESC(MucHost)].
+    ["SELECT id, room, options FROM muc_rooms WHERE muc_host = ", ?ESC(MucHost)].
 
 insert_nick(MucHost, {UserU, UserS}, Nick) ->
     ["INSERT INTO muc_registered (muc_host, luser, lserver, nick)"
-     " VALUES (", ?ESC(MucHost), ", ", ?ESC(UserU), ",", ?ESC(UserS), ",", ?ESC(Nick), ")"].
+     " VALUES (", ?ESC(MucHost), ", ", ?ESC(UserU), ",", ?ESC(UserS),
+     ",", ?ESC(Nick), ")"].
 
 select_nick_user(MucHost, UserS, Nick) ->
     ["SELECT luser FROM muc_registered WHERE muc_host = ", ?ESC(MucHost),
@@ -252,5 +251,3 @@ select_nick(MucHost, UserU, UserS) ->
 delete_nick(MucHost, UserU, UserS) ->
        ["DELETE FROM muc_registered WHERE muc_host = ", ?ESC(MucHost),
          " AND luser = ", ?ESC(UserU), "AND lserver =", ?ESC(UserS)].
-
-
